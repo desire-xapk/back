@@ -1,0 +1,22 @@
+name = "combat-zone-server"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# Durable Objects для хранения состояния игры
+[durable_objects]
+bindings = [
+  { name = "GAME_ROOM", class_name = "GameRoom" }
+]
+
+[[migrations]]
+tag = "v1"
+new_classes = ["GameRoom"]
+
+# Настройки для production
+[env.production]
+name = "combat-zone-server-prod"
+route = { pattern = "game.yourdomain.com/*", zone_name = "yourdomain.com" }
+
+# Использование WebSockets
+[triggers]
+crons = []
