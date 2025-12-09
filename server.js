@@ -1,9 +1,6 @@
 /**
- * 3D Shooter Multiplayer Server
- * Node.js WebSocket Server for Combat Zone
- * 
- * Для Cloudflare Workers используйте server-cf-worker.js
- * Для локального запуска: node server.js
+ * Combat Zone - Multiplayer WebSocket Server
+ * v3.0 - С полной отладкой, CORS и уникальным ID инстанса
  */
 
 const WebSocket = require('ws');
@@ -11,34 +8,110 @@ const http = require('http');
 
 const PORT = process.env.PORT || 8080;
 
-// Создаем HTTP сервер для health checks
+// Уникальный ID этого инстанса сервера (для отладки Railway)
+const INSTANCE_ID = 'srv_' + Math.random().toString(36).substr(2, 6);
+console.log(`\n🔷 Instance ID: ${INSTANCE_ID}\n`);
+
+// CORS headers для HTTP
+const corsHeaders = {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type'
+};
+
+// HTTP сервер
 const server = http.createServer((req, res) => {
-    if (req.url === '/health') {
-        res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ status: 'ok', players: Object.keys(players).length }));
+    // CORS preflight
+    if (req.method === 'OPTIONS') {
+        res.writeHead(204, corsHeaders);
+        res.end();
+        return;
+    }
+    
+    const headers = { ...corsHeaders, 'Content-Type': 'application/json' };
+    
+    if (req.url === '/health' || req.url === '/api/status') {
+        res.writeHead(200, headers);
+        res.end(JSON.stringify({ 
+            status: 'ok',
+            instanceId: INSTANCE_ID,
+            players: Object.keys(players).length,
+            playerNames: Object.values(players).map(p => p.name),
+            connections: wss.clients.size,
+            uptime: process.uptime(),
+            timestamp: Date.now()
+        }));
+    } else if (req.url === '/api/players') {
+        res.writeHead(200, headers);
+        res.end(JSON.stringify({
+            count: Object.keys(players).length,
+            players: Object.values(players).map(p => ({
+                id: p.id,
+                name: p.name,
+                kills: p.kills,
+                deaths: p.deaths
+            }))
+        }));
     } else {
-        res.writeHead(200, { 'Content-Type': 'text/html' });
+        res.writeHead(200, { ...corsHeaders, 'Content-Type': 'text/html' });
         res.end(`
-            <html>
-            <head><title>Combat Zone Server</title></head>
-            <body style="background:#1a1a2e;color:white;font-family:Arial;padding:40px;">
-                <h1>🎮 Combat Zone Game Server</h1>
-                <p>WebSocket сервер запущен на порту ${PORT}</p>
-                <p>Активных игроков: ${Object.keys(players).length}</p>
-                <p>Подключитесь через ws://localhost:${PORT}</p>
-            </body>
-            </html>
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Combat Zone Server</title>
+    <meta charset="UTF-8">
+    <style>
+        body { background: #1a1a2e; color: #fff; font-family: Arial, sans-serif; padding: 40px; }
+        h1 { color: #00ff88; }
+        .status { background: #16213e; padding: 20px; border-radius: 10px; margin: 20px 0; }
+        .online { color: #00ff88; }
+        .info { color: #888; margin: 10px 0; }
+        code { background: #333; padding: 5px 10px; border-radius: 5px; }
+        .players { margin-top: 20px; }
+        .player { background: #222; padding: 10px; margin: 5px 0; border-radius: 5px; }
+    </style>
+</head>
+<body>
+    <h1>🎮 Combat Zone Game Server</h1>
+    <div class="status">
+        <p class="online">✅ Сервер запущен и работает</p>
+        <p class="info">🔷 Instance ID: <code style="color:#ff0">${INSTANCE_ID}</code></p>
+        <p class="info">WebSocket: <code>wss://${req.headers.host || 'your-domain.com'}</code></p>
+        <p class="info">Активных игроков: <strong>${Object.keys(players).length}</strong></p>
+        <p class="info">WS соединений: <strong>${wss.clients.size}</strong></p>
+        <p class="info">Uptime: ${Math.floor(process.uptime())} секунд</p>
+    </div>
+    <div class="players">
+        <h3>Игроки онлайн:</h3>
+        ${Object.values(players).map(p => `
+            <div class="player">
+                <strong>${p.name}</strong> - K: ${p.kills} / D: ${p.deaths}
+            </div>
+        `).join('') || '<p class="info">Нет активных игроков</p>'}
+    </div>
+    <script>
+        // Auto-refresh every 5 seconds
+        setTimeout(() => location.reload(), 5000);
+    </script>
+</body>
+</html>
         `);
     }
 });
 
-// WebSocket сервер
-const wss = new WebSocket.Server({ server });
+// WebSocket сервер с CORS
+const wss = new WebSocket.Server({ 
+    server,
+    verifyClient: (info, callback) => {
+        // Allow all origins
+        callback(true);
+    }
+});
 
 // Хранилище игроков
 const players = {};
 
-// Конфигурация оружия (для валидации урона)
+// Weapons config
 const WEAPONS = {
     ak47: { damage: 25, fireRate: 100 },
     m4a1: { damage: 22, fireRate: 80 },
@@ -46,23 +119,35 @@ const WEAPONS = {
     deagle: { damage: 50, fireRate: 300 }
 };
 
-// Генерация уникального ID
 function generateId() {
-    return 'player_' + Math.random().toString(36).substr(2, 9);
+    return 'p_' + Math.random().toString(36).substr(2, 9);
 }
 
-// Отправка всем кроме отправителя
+function log(type, message) {
+    const timestamp = new Date().toISOString().substr(11, 8);
+    const colors = {
+        info: '\x1b[36m',
+        success: '\x1b[32m',
+        warn: '\x1b[33m',
+        error: '\x1b[31m',
+        reset: '\x1b[0m'
+    };
+    console.log(`${colors[type] || ''}[${timestamp}] ${message}${colors.reset}`);
+}
+
 function broadcast(data, excludeId = null) {
     const message = JSON.stringify(data);
+    let sent = 0;
     wss.clients.forEach(client => {
         if (client.readyState === WebSocket.OPEN && client.playerId !== excludeId) {
             client.send(message);
+            sent++;
         }
     });
+    return sent;
 }
 
-// Отправка конкретному игроку
-function sendToPlayer(playerId, data) {
+function sendTo(playerId, data) {
     wss.clients.forEach(client => {
         if (client.readyState === WebSocket.OPEN && client.playerId === playerId) {
             client.send(JSON.stringify(data));
@@ -70,7 +155,6 @@ function sendToPlayer(playerId, data) {
     });
 }
 
-// Отправка всем
 function broadcastAll(data) {
     const message = JSON.stringify(data);
     wss.clients.forEach(client => {
@@ -80,25 +164,35 @@ function broadcastAll(data) {
     });
 }
 
-wss.on('connection', (ws) => {
+// Connection handler
+wss.on('connection', (ws, req) => {
     const playerId = generateId();
     ws.playerId = playerId;
+    ws.isAlive = true;
     
-    console.log(`[+] Новое подключение: ${playerId}`);
+    const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    log('success', `[+] Новое подключение: ${playerId} от ${ip}`);
+    
+    // Ping/Pong для keep-alive
+    ws.on('pong', () => {
+        ws.isAlive = true;
+    });
     
     ws.on('message', (message) => {
         try {
-            const data = JSON.parse(message);
+            const data = JSON.parse(message.toString());
             
             switch (data.type) {
                 case 'join':
-                    // Регистрация нового игрока
+                    const spawnX = (Math.random() - 0.5) * 50;
+                    const spawnZ = (Math.random() - 0.5) * 50;
+                    
                     players[playerId] = {
                         id: playerId,
-                        name: data.name || 'Player',
-                        x: (Math.random() - 0.5) * 50,
+                        name: (data.name || 'Player').substring(0, 20),
+                        x: spawnX,
                         y: 2,
-                        z: (Math.random() - 0.5) * 50,
+                        z: spawnZ,
                         rotY: 0,
                         health: 100,
                         kills: 0,
@@ -106,35 +200,39 @@ wss.on('connection', (ws) => {
                         lastShot: 0
                     };
                     
-                    console.log(`[JOIN] ${players[playerId].name} (${playerId})`);
+                    log('success', `[JOIN] ${players[playerId].name} (${playerId})`);
                     
-                    // Отправляем игроку его ID
+                    // Отправляем welcome с ID, instanceId и списком игроков
                     ws.send(JSON.stringify({
                         type: 'welcome',
                         id: playerId,
+                        instanceId: INSTANCE_ID,
+                        playersCount: Object.keys(players).length,
                         players: Object.values(players).filter(p => p.id !== playerId)
                     }));
                     
-                    // Оповещаем других
-                    broadcast({
+                    log('info', `  → Отправлен welcome, игроков на сервере: ${Object.keys(players).length}`);
+                    
+                    // Оповещаем остальных
+                    const joinCount = broadcast({
                         type: 'playerJoin',
                         id: playerId,
                         name: players[playerId].name,
-                        x: players[playerId].x,
-                        y: players[playerId].y,
-                        z: players[playerId].z
+                        x: spawnX,
+                        y: 2,
+                        z: spawnZ
                     }, playerId);
+                    
+                    log('info', `  → Оповещено ${joinCount} игроков о присоединении`);
                     break;
                     
                 case 'position':
-                    // Обновление позиции игрока
                     if (players[playerId]) {
                         players[playerId].x = data.x;
                         players[playerId].y = data.y;
                         players[playerId].z = data.z;
                         players[playerId].rotY = data.rotY;
                         
-                        // Транслируем позицию другим
                         broadcast({
                             type: 'position',
                             id: playerId,
@@ -147,19 +245,7 @@ wss.on('connection', (ws) => {
                     break;
                     
                 case 'bullet':
-                    // Игрок выстрелил
                     if (players[playerId]) {
-                        const now = Date.now();
-                        const weapon = WEAPONS[data.weapon] || WEAPONS.ak47;
-                        
-                        // Anti-cheat: проверка скорострельности
-                        if (now - players[playerId].lastShot < weapon.fireRate * 0.8) {
-                            console.log(`[WARN] Слишком быстрая стрельба от ${playerId}`);
-                            return;
-                        }
-                        players[playerId].lastShot = now;
-                        
-                        // Транслируем пулю другим
                         broadcast({
                             type: 'bullet',
                             owner: playerId,
@@ -171,54 +257,58 @@ wss.on('connection', (ws) => {
                     break;
                     
                 case 'hit':
-                    // Игрок попал в кого-то
                     if (players[playerId] && players[data.target]) {
                         const target = players[data.target];
-                        const damage = Math.min(data.damage, 100); // Лимит урона
+                        const attacker = players[playerId];
+                        const damage = Math.min(data.damage || 25, 100);
                         
                         target.health -= damage;
                         
+                        log('info', `[HIT] ${attacker.name} → ${target.name} (-${damage} HP, осталось: ${target.health})`);
+                        
                         // Отправляем урон жертве
-                        sendToPlayer(data.target, {
+                        sendTo(data.target, {
                             type: 'hit',
                             target: 'local',
                             damage: damage,
-                            attacker: playerId
+                            attacker: attacker.name
                         });
                         
-                        console.log(`[HIT] ${players[playerId].name} -> ${target.name} (-${damage} HP, осталось: ${target.health})`);
-                        
-                        // Проверяем смерть
+                        // Смерть
                         if (target.health <= 0) {
-                            players[playerId].kills++;
+                            attacker.kills++;
                             target.deaths++;
                             
-                            // Оповещаем всех об убийстве
+                            log('success', `[KILL] ${attacker.name} убил ${target.name}`);
+                            
                             broadcastAll({
                                 type: 'kill',
-                                killer: players[playerId].name,
+                                killer: attacker.name,
                                 killerId: playerId,
                                 victim: target.name,
                                 victimId: data.target,
                                 weapon: data.weapon || 'ak47'
                             });
                             
-                            console.log(`[KILL] ${players[playerId].name} убил ${target.name}`);
-                            
-                            // Респавн жертвы
+                            // Респавн через 3 секунды
                             setTimeout(() => {
                                 if (players[data.target]) {
-                                    players[data.target].health = 100;
-                                    players[data.target].x = (Math.random() - 0.5) * 50;
-                                    players[data.target].y = 2;
-                                    players[data.target].z = (Math.random() - 0.5) * 50;
+                                    const newX = (Math.random() - 0.5) * 50;
+                                    const newZ = (Math.random() - 0.5) * 50;
                                     
-                                    sendToPlayer(data.target, {
+                                    players[data.target].health = 100;
+                                    players[data.target].x = newX;
+                                    players[data.target].y = 2;
+                                    players[data.target].z = newZ;
+                                    
+                                    sendTo(data.target, {
                                         type: 'respawn',
-                                        x: players[data.target].x,
-                                        y: players[data.target].y,
-                                        z: players[data.target].z
+                                        x: newX,
+                                        y: 2,
+                                        z: newZ
                                     });
+                                    
+                                    log('info', `[RESPAWN] ${target.name}`);
                                 }
                             }, 3000);
                         }
@@ -226,10 +316,9 @@ wss.on('connection', (ws) => {
                     break;
                     
                 case 'chat':
-                    // Чат сообщение
                     if (players[playerId] && data.message) {
-                        const msg = data.message.substring(0, 200); // Лимит длины
-                        console.log(`[CHAT] ${players[playerId].name}: ${msg}`);
+                        const msg = data.message.substring(0, 200);
+                        log('info', `[CHAT] ${players[playerId].name}: ${msg}`);
                         
                         broadcast({
                             type: 'chat',
@@ -240,18 +329,17 @@ wss.on('connection', (ws) => {
                     break;
                     
                 case 'ping':
-                    // Пинг для измерения задержки
                     ws.send(JSON.stringify({ type: 'pong', time: data.time }));
                     break;
             }
         } catch (e) {
-            console.error('Ошибка обработки сообщения:', e);
+            log('error', `Ошибка обработки сообщения: ${e.message}`);
         }
     });
     
-    ws.on('close', () => {
+    ws.on('close', (code, reason) => {
         if (players[playerId]) {
-            console.log(`[-] Отключение: ${players[playerId].name} (${playerId})`);
+            log('warn', `[-] Отключение: ${players[playerId].name} (${playerId}) - код: ${code}`);
             
             broadcast({
                 type: 'playerLeave',
@@ -264,11 +352,23 @@ wss.on('connection', (ws) => {
     });
     
     ws.on('error', (error) => {
-        console.error(`Ошибка WebSocket для ${playerId}:`, error);
+        log('error', `Ошибка WS для ${playerId}: ${error.message}`);
     });
 });
 
-// Периодическая синхронизация состояния
+// Периодическая проверка соединений
+const pingInterval = setInterval(() => {
+    wss.clients.forEach(ws => {
+        if (!ws.isAlive) {
+            log('warn', `Отключение неактивного клиента: ${ws.playerId}`);
+            return ws.terminate();
+        }
+        ws.isAlive = false;
+        ws.ping();
+    });
+}, 30000);
+
+// Синхронизация состояния каждые 5 секунд
 setInterval(() => {
     if (Object.keys(players).length > 0) {
         broadcastAll({
@@ -288,14 +388,35 @@ setInterval(() => {
     }
 }, 5000);
 
-// Запуск сервера
-server.listen(PORT, () => {
-    console.log('╔════════════════════════════════════════╗');
-    console.log('║     🎮 COMBAT ZONE GAME SERVER 🎮      ║');
-    console.log('╠════════════════════════════════════════╣');
-    console.log(`║  HTTP:      http://localhost:${PORT}       ║`);
-    console.log(`║  WebSocket: ws://localhost:${PORT}         ║`);
-    console.log('╠════════════════════════════════════════╣');
-    console.log('║  Готов принимать подключения!         ║');
-    console.log('╚════════════════════════════════════════╝');
+wss.on('close', () => {
+    clearInterval(pingInterval);
+});
+
+// Запуск
+server.listen(PORT, '0.0.0.0', () => {
+    console.log('');
+    console.log('\x1b[32m╔══════════════════════════════════════════════════╗\x1b[0m');
+    console.log('\x1b[32m║     🎮 COMBAT ZONE GAME SERVER v2.0 🎮           ║\x1b[0m');
+    console.log('\x1b[32m╠══════════════════════════════════════════════════╣\x1b[0m');
+    console.log('\x1b[32m║\x1b[0m  HTTP Status:   \x1b[36mhttp://localhost:' + PORT + '\x1b[0m              \x1b[32m║\x1b[0m');
+    console.log('\x1b[32m║\x1b[0m  WebSocket:     \x1b[36mws://localhost:' + PORT + '\x1b[0m                \x1b[32m║\x1b[0m');
+    console.log('\x1b[32m║\x1b[0m  API Status:    \x1b[36mhttp://localhost:' + PORT + '/api/status\x1b[0m   \x1b[32m║\x1b[0m');
+    console.log('\x1b[32m╠══════════════════════════════════════════════════╣\x1b[0m');
+    console.log('\x1b[32m║\x1b[0m  \x1b[33m✓ CORS включен для всех origins\x1b[0m                 \x1b[32m║\x1b[0m');
+    console.log('\x1b[32m║\x1b[0m  \x1b[33m✓ WebSocket ping/pong активен\x1b[0m                   \x1b[32m║\x1b[0m');
+    console.log('\x1b[32m║\x1b[0m  \x1b[33m✓ Синхронизация каждые 5 секунд\x1b[0m                 \x1b[32m║\x1b[0m');
+    console.log('\x1b[32m╠══════════════════════════════════════════════════╣\x1b[0m');
+    console.log('\x1b[32m║\x1b[0m  \x1b[32m🚀 Сервер готов принимать подключения!\x1b[0m          \x1b[32m║\x1b[0m');
+    console.log('\x1b[32m╚══════════════════════════════════════════════════╝\x1b[0m');
+    console.log('');
+});
+
+// Graceful shutdown
+process.on('SIGTERM', () => {
+    log('warn', 'Получен SIGTERM, завершение работы...');
+    wss.close(() => {
+        server.close(() => {
+            process.exit(0);
+        });
+    });
 });
